@@ -4,7 +4,7 @@ KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 PWD := $(shell pwd)
 
-VERSION := 0.1.0
+VERSION := 0.2.0
 DKMS_SRC := /usr/src/tcp_bbr_aggr-$(VERSION)
 
 all:

@@ -12,6 +12,9 @@
  *     cwnd is held at 0.5*BDP instead of 4 packets (as in BBRv2)
  *   - optional bbrplus-style PROBE_BW cycling: probe again after a random
  *     2..8 min_rtt instead of a fixed 8-phase cycle
+ *   - re-enter STARTUP when a non-app-limited sample beats the bw estimate
+ *     by 15%: request/response traffic can end STARTUP at a tiny bw, and a
+ *     later download on that connection would otherwise grow 25% per cycle
  *   - cruise pacing gain stays 1.0 and the policer (long-term bw) detection
  *     and loss handling are unchanged, so it does not build a standing queue
  *
@@ -195,6 +198,18 @@ MODULE_PARM_DESC(full_bw_cnt, "STARTUP rounds without bw growth before exit, 1..
 static int rand_cycle = 1;
 module_param(rand_cycle, int, 0644);
 MODULE_PARM_DESC(rand_cycle, "1 = probe bw again after a random 2..8 min_rtt (bbrplus), 0 = upstream 8-phase cycle");
+/* Re-enter STARTUP from PROBE_BW when a non-app-limited sample exceeds the bw
+ * estimate by this ratio [off]. Request/response traffic (web pages, API
+ * calls) can end STARTUP at a tiny bw; a later download on the same
+ * connection would then only grow 25% per gain cycle. 0 disables.
+ */
+static int restartup_ratio = 1150;
+module_param(restartup_ratio, int, 0644);
+MODULE_PARM_DESC(restartup_ratio, "re-enter STARTUP when a sample beats the bw estimate by this per mille ratio, 0 = off (upstream off)");
+/* How many times flows re-entered STARTUP, for verification: */
+static unsigned int restartup_count;
+module_param(restartup_count, uint, 0444);
+MODULE_PARM_DESC(restartup_count, "number of STARTUP re-entries since load (read only)");
 /* ==================== END PARAMETERS ==================== */
 
 /* Clamp a per mille gain into BBR_UNIT scale; the gain fields are 10 bits. */
@@ -942,6 +957,21 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 * network rate no matter how long. We automatically leave this
 	 * phase when app writes faster than the network can deliver :)
 	 */
+	/* The network delivered clearly more than our model allows: the
+	 * estimate is stale (STARTUP ended on short bursts, or competing
+	 * traffic left), so ramp up again by doubling per round.
+	 */
+	if (restartup_ratio > 0 && bbr->mode == BBR_PROBE_BW &&
+	    !bbr->lt_use_bw && !rs->is_app_limited && bbr_max_bw(sk) &&
+	    bw * 1000 >= (u64)bbr_max_bw(sk) * clamp(restartup_ratio, 1050, 4000)) {
+		bbr->full_bw_reached = 0;
+		bbr->full_bw = 0;
+		bbr->full_bw_cnt = 0;
+		tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
+		bbr_reset_startup_mode(sk);
+		restartup_count++;
+	}
+
 	if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
 		minmax_running_max(&bbr->bw, clamp(bw_rtts, 2, 1000), bbr->rtt_cnt, bw);
@@ -1330,4 +1360,4 @@ MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Kopw <https://github.com/Kopw/tcp_bbr_aggr>");
 MODULE_DESCRIPTION("TCP BBR aggr: aggressive, tunable BBR v1 variant");
-MODULE_VERSION("0.1.0");
+MODULE_VERSION("0.2.0");

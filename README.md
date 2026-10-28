@@ -16,6 +16,7 @@
 | PROBE_RTT 持续 | 200ms | 100ms | nanqinlang |
 | PROBE_RTT 时的 cwnd | 4 个包 | 0.5 × BDP | BBRv2 |
 | PROBE_BW 探测周期 | 固定 8 阶段 | 随机 2~8 个 min_rtt | bbrplus |
+| 带宽被低估时 | 每个探测周期只涨 25% | 重新进入 STARTUP，每个往返翻倍 | 本项目（v0.2） |
 | 巡航速度 | 1.0 | 1.0（不变） | — |
 | 限速（policer）识别、丢包处理 | — | 不变 | — |
 
@@ -24,6 +25,18 @@
 - **不提高巡航速度**：nanqinlang 等魔改把巡航速度提到 1.25~1.5 倍，会在瓶颈处一直排队，丢包和延迟都会上升，所以这里保持 1.0。
 - **保留限速识别**：运营商 QoS 按速率丢包时，BBR 会自动按限速值发送。放宽这部分（如 nanqinlang）在限速线路上会更差。
 - **PROBE_RTT 不再“断崖”**：原版每 10 秒把 cwnd 降到 4 个包持续 200ms，长 RTT 链路上吞吐会周期性掉坑。这里改为 0.5 × BDP，与 BBRv2 一致。顺带修正了 tsunami 的问题：tsunami 只把 cwnd 减半，但进入计时的条件仍然是“在途包 ≤ 4”，实际每个 ACK 都在继续减半，最后照样掉到 4 个包。
+
+- **复用连接上的下载提速慢（v0.2 修复）**：网页、API 这类“一问一答”的小请求，会让 BBR 在很低的速度上就判定“带宽已满”，结束 STARTUP。之后同一条连接上开始下载文件或视频时，原版 BBR 每个探测周期（8 个往返，跨太平洋约 1.6 秒）只把速度提高 25%。代理、HTTP/2 这类长期复用的连接最容易遇到。v0.2 在 PROBE_BW 中只要看到非 app-limited 的采样比当前带宽估计高 15% 以上，就重新进入 STARTUP。
+
+  实测（家庭宽带经 AnyTLS 代理连美国服务器，RTT 约 200ms，同一条连接先发 15 个 30KB 请求再下载，3 轮平均）：
+
+  | | 原版 bbr | bbr_aggr v0.2 |
+  |---|---|---|
+  | 复用连接下载 5MB | 8.25s | 4.56s |
+  | 复用连接下载 20MB | 19.25s | 5.84s |
+  | 全新连接 | 基本相同 | 基本相同 |
+
+  当时抓到的原版连接状态：带宽估计只有 1.5 Mbps，此后 5.6 秒里只爬到 8.2 Mbps。
 
 ## 安装（DKMS，内核升级后自动重新编译）
 
@@ -49,6 +62,8 @@ sysctl -w net.ipv4.tcp_congestion_control=bbr_aggr
 
 卸载：`make dkms-remove`（先把默认算法改回 `bbr`）。
 
+从 0.1.0 升级：先把默认算法改回 `bbr`，等用旧模块的连接结束（或用 `ss -K` 关掉），再执行 `dkms remove -m tcp_bbr_aggr -v 0.1.0 --all`、`modprobe -r tcp_bbr_aggr`，然后按上面的步骤 `make dkms`。
+
 已在 Debian 13（6.12.113）和 Debian 12（6.1.0）上编译、DKMS 安装、加载，并跑过实际传输。内核 6.10 前后 `cong_control` 接口的差异已做兼容。
 
 ## 在线调参
@@ -68,6 +83,8 @@ sysctl -w net.ipv4.tcp_congestion_control=bbr_aggr
 | `probe_rtt_mode_ms` | 100 [200] | PROBE_RTT 持续时间，0 = 不做 |
 | `probe_rtt_cwnd_gain` | 500 [0] | PROBE_RTT 时 cwnd 占 BDP 的比例，0 = 原版的 4 个包 |
 | `rand_cycle` | 1 [0] | 1 = bbrplus 式随机探测周期，0 = 原版 8 阶段 |
+| `restartup_ratio` | 1150 [关] | 采样比带宽估计高出这个比例就重新进入 STARTUP（1050~4000），0 = 关闭 |
+| `restartup_count` | 只读 | 加载以来重新进入 STARTUP 的次数，用来确认是否生效 |
 
 例如恢复原版 PROBE_RTT 行为：
 
