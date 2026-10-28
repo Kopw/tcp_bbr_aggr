@@ -13,8 +13,9 @@
  *   - optional bbrplus-style PROBE_BW cycling: probe again after a random
  *     2..8 min_rtt instead of a fixed 8-phase cycle
  *   - re-enter STARTUP when a non-app-limited sample beats the bw estimate
- *     by 15%: request/response traffic can end STARTUP at a tiny bw, and a
+ *     by 8%: request/response traffic can end STARTUP at a tiny bw, and a
  *     later download on that connection would otherwise grow 25% per cycle
+ *   - PROBE_BW probes at 1.5x instead of 1.25x (chosen from peak-hour tests)
  *   - cruise pacing gain stays 1.0 and the policer (long-term bw) detection
  *     and loss handling are unchanged, so it does not build a standing queue
  *
@@ -181,7 +182,7 @@ static int cwnd_gain = 2500;
 module_param(cwnd_gain, int, 0644);
 MODULE_PARM_DESC(cwnd_gain, "PROBE_BW cwnd gain per mille (upstream 2000)");
 /* PROBE_BW pacing gains [1250 / 750 / 1000]: */
-static int probe_up_gain = 1250;
+static int probe_up_gain = 1500;
 module_param(probe_up_gain, int, 0644);
 MODULE_PARM_DESC(probe_up_gain, "PROBE_BW probing pacing gain per mille (upstream 1250)");
 static int probe_down_gain = 750;
@@ -203,7 +204,7 @@ MODULE_PARM_DESC(rand_cycle, "1 = probe bw again after a random 2..8 min_rtt (bb
  * calls) can end STARTUP at a tiny bw; a later download on the same
  * connection would then only grow 25% per gain cycle. 0 disables.
  */
-static int restartup_ratio = 1150;
+static int restartup_ratio = 1080;
 module_param(restartup_ratio, int, 0644);
 MODULE_PARM_DESC(restartup_ratio, "re-enter STARTUP when a sample beats the bw estimate by this per mille ratio, 0 = off (upstream off)");
 /* How many times flows re-entered STARTUP, for verification: */
@@ -1360,4 +1361,4 @@ MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Kopw <https://github.com/Kopw/tcp_bbr_aggr>");
 MODULE_DESCRIPTION("TCP BBR aggr: aggressive, tunable BBR v1 variant");
-MODULE_VERSION("0.2.0");
+MODULE_VERSION("0.3.0");
