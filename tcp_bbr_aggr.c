@@ -162,15 +162,15 @@ static int bw_rtts = 15;
 module_param(bw_rtts, int, 0644);
 MODULE_PARM_DESC(bw_rtts, "bw max filter window in rounds (upstream 10)");
 /* Window length of min_rtt filter, in sec [10]: */
-static int min_rtt_win_sec = 20;
+static int min_rtt_win_sec = 30;
 module_param(min_rtt_win_sec, int, 0644);
 MODULE_PARM_DESC(min_rtt_win_sec, "min_rtt filter window in seconds (upstream 10)");
 /* Minimum time (in ms) spent in BBR_PROBE_RTT mode [200], 0 disables it: */
-static int probe_rtt_mode_ms = 100;
+static int probe_rtt_mode_ms = 60;
 module_param(probe_rtt_mode_ms, int, 0644);
 MODULE_PARM_DESC(probe_rtt_mode_ms, "PROBE_RTT duration in ms, 0 = never probe (upstream 200)");
 /* cwnd during PROBE_RTT as a fraction of BDP; 0 means 4 packets [0]: */
-static int probe_rtt_cwnd_gain = 500;
+static int probe_rtt_cwnd_gain = 750;
 module_param(probe_rtt_cwnd_gain, int, 0644);
 MODULE_PARM_DESC(probe_rtt_cwnd_gain, "PROBE_RTT cwnd in per mille of BDP, 0 = 4 packets (upstream 0)");
 /* STARTUP pacing/cwnd gain [2885]; DRAIN uses its inverse: */
@@ -211,6 +211,28 @@ MODULE_PARM_DESC(restartup_ratio, "re-enter STARTUP when a sample beats the bw e
 static unsigned int restartup_count;
 module_param(restartup_count, uint, 0444);
 MODULE_PARM_DESC(restartup_count, "number of STARTUP re-entries since load (read only)");
+/* Enable LT policer detection/clamping [1 upstream, 0 = disabled]: */
+static int lt_bw_enable = 0;
+module_param(lt_bw_enable, int, 0644);
+MODULE_PARM_DESC(lt_bw_enable, "1 = enable LT policer clamping (upstream), 0 = disable");
+/* Pacing margin percentage below estimated bw [1 upstream, 0 = full pipe]: */
+static int pacing_margin_pct = 0;
+module_param(pacing_margin_pct, int, 0644);
+MODULE_PARM_DESC(pacing_margin_pct, "pacing margin percent below bw, 0..10 (upstream 1)");
+/* ACK aggregation window in RTTs [5 upstream] and max boost duration in ms [100 upstream]: */
+static int extra_acked_win = 10;
+module_param(extra_acked_win, int, 0644);
+MODULE_PARM_DESC(extra_acked_win, "ACK aggregation window in RTTs, 2..30 (upstream 5)");
+static int extra_acked_max_ms = 200;
+module_param(extra_acked_max_ms, int, 0644);
+MODULE_PARM_DESC(extra_acked_max_ms, "max ACK aggregation cwnd boost in ms of bw, 20..500 (upstream 100)");
+/* Experimental: skip packet conservation in TCP_CA_Recovery [0 = off, NOT recommended]: */
+static int loss_preserve_cwnd = 0;
+module_param(loss_preserve_cwnd, int, 0644);
+MODULE_PARM_DESC(loss_preserve_cwnd, "experimental: 1 = keep prior_cwnd in TCP_CA_Recovery (risks retransmit storms), 0 = upstream packet_conservation");
+static unsigned int loss_preserve_count;
+module_param(loss_preserve_count, uint, 0444);
+MODULE_PARM_DESC(loss_preserve_count, "number of experimental recovery cwnd preserves since load (read only)");
 /* ==================== END PARAMETERS ==================== */
 
 /* Clamp a per mille gain into BBR_UNIT scale; the gain fields are 10 bits. */
@@ -226,13 +248,8 @@ static u32 bbr_rand_below(u32 n)
 /* Skip TSO below the following bandwidth (bits/sec): */
 static const int bbr_min_tso_rate = 1200000;
 
-/* Pace at ~1% below estimated bw, on average, to reduce queue at bottleneck.
- * In order to help drive the network toward lower queues and low latency while
- * maintaining high utilization, the average pacing rate aims to be slightly
- * lower than the estimated bandwidth. This is an important aspect of the
- * design.
- */
-static const int bbr_pacing_margin_percent = 1;
+/* Pace at pacing_margin_pct% below estimated bw (upstream 1%). */
+#define bbr_pacing_margin_percent	clamp(pacing_margin_pct, 0, 10)
 
 /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
  * that will allow a smoothly increasing pacing rate that will double each RTT
@@ -288,11 +305,11 @@ static const u32 bbr_lt_bw_max_rtts = 48;
 /* Gain factor for adding extra_acked to target cwnd: */
 static const int bbr_extra_acked_gain = BBR_UNIT;
 /* Window length of extra_acked window. */
-static const u32 bbr_extra_acked_win_rtts = 5;
+#define bbr_extra_acked_win_rtts	((u32)clamp(extra_acked_win, 2, 30))
 /* Max allowed val for ack_epoch_acked, after which sampling epoch is reset */
 static const u32 bbr_ack_epoch_acked_reset_thresh = 1U << 20;
 /* Time period for clamping cwnd increment due to ack aggregation */
-static const u32 bbr_extra_acked_max_us = 100 * 1000;
+#define bbr_extra_acked_max_us		((u32)clamp(extra_acked_max_ms, 20, 500) * 1000U)
 
 static void bbr_check_probe_rtt_done(struct sock *sk);
 static u32 bbr_max_bw(const struct sock *sk);
@@ -585,6 +602,14 @@ static bool bbr_set_cwnd_to_recover_or_restore(
 	 * in two steps. First, here we deduct the number of lost packets.
 	 * Then, in bbr_set_cwnd() we slow start up toward the target cwnd.
 	 */
+	if (unlikely(loss_preserve_cwnd) && state == TCP_CA_Recovery) {
+		bbr->prev_ca_state = state;
+		bbr->packet_conservation = 0;
+		loss_preserve_count++;
+		*new_cwnd = max(cwnd, bbr->prior_cwnd);
+		return false;
+	}
+
 	if (rs->losses > 0)
 		cwnd = max_t(s32, cwnd - rs->losses, 1);
 
@@ -855,6 +880,12 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	u32 lost, delivered;
 	u64 bw;
 	u32 t;
+
+	if (!lt_bw_enable) {
+		if (unlikely(bbr->lt_use_bw))
+			bbr_reset_lt_bw_sampling(sk);
+		return;
+	}
 
 	if (bbr->lt_use_bw) {	/* already using long-term rate, lt_bw? */
 		if (bbr->mode == BBR_PROBE_BW && bbr->round_start &&
@@ -1361,4 +1392,4 @@ MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Kopw <https://github.com/Kopw/tcp_bbr_aggr>");
 MODULE_DESCRIPTION("TCP BBR aggr: aggressive, tunable BBR v1 variant");
-MODULE_VERSION("0.3.0");
+MODULE_VERSION("0.4.0");

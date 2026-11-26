@@ -12,20 +12,25 @@
 | 判定带宽已满前等待轮数 | 3 | 4 | hysteria aggressive |
 | 稳定期 cwnd 倍数 | 2.0 | 2.5 | hysteria aggressive |
 | 带宽最大值记忆 | 10 轮 | 15 轮 | tsunami |
-| PROBE_RTT 间隔 | 10 秒 | 20 秒 | tsunami |
-| PROBE_RTT 持续 | 200ms | 100ms | nanqinlang |
-| PROBE_RTT 时的 cwnd | 4 个包 | 0.5 × BDP | BBRv2 |
+| PROBE_RTT 间隔 | 10 秒 | 30 秒 | 本项目（v0.4，原 v0.1 为 20 秒） |
+| PROBE_RTT 持续 | 200ms | 60ms | 本项目（v0.4，原 v0.1 为 100ms） |
+| PROBE_RTT 时的 cwnd | 4 个包 | 0.75 × BDP | 本项目（v0.4，原 v0.1 为 0.5 × BDP） |
 | PROBE_BW 探测周期 | 固定 8 阶段 | 随机 2~8 个 min_rtt | bbrplus |
 | PROBE_BW 探测倍数 | 1.25 | 1.5 | 本项目（v0.3，晚高峰实测） |
 | 带宽被低估时 | 每个探测周期只涨 25% | 采样高出估计 8% 就重新进入 STARTUP，每个往返翻倍 | 本项目（v0.2，v0.3 调整阈值） |
 | 巡航速度 | 1.0 | 1.0（不变） | — |
-| 限速（policer）识别、丢包处理 | — | 不变 | — |
+| Pacing 余量 | 降速 1% | 0%（可调 0~10%） | 本项目（v0.4） |
+| ACK 聚合窗口 / 补偿上限 | 5 轮 / 100ms | 10 轮 / 200ms（可调） | 本项目（v0.4） |
+| 限速（LT policer）识别 | 开启 | 默认关闭（可在线开启） | 本项目（v0.4） |
+| 丢包恢复期 `packet_conservation` | 开启 | 保持开启（实验参数默认关） | 本项目（v0.4 实测保留） |
 
 设计取舍：
 
 - **不提高巡航速度**：nanqinlang 等魔改把巡航速度提到 1.25~1.5 倍，会在瓶颈处一直排队，丢包和延迟都会上升，所以这里保持 1.0。
-- **保留限速识别**：运营商 QoS 按速率丢包时，BBR 会自动按限速值发送。放宽这部分（如 nanqinlang）在限速线路上会更差。
-- **PROBE_RTT 不再“断崖”**：原版每 10 秒把 cwnd 降到 4 个包持续 200ms，长 RTT 链路上吞吐会周期性掉坑。这里改为 0.5 × BDP，与 BBRv2 一致。顺带修正了 tsunami 的问题：tsunami 只把 cwnd 减半，但进入计时的条件仍然是“在途包 ≤ 4”，实际每个 ACK 都在继续减半，最后照样掉到 4 个包。
+- **可切换的 LT 限速识别（v0.4）**：原版 BBR 的 LT policer 在连续 2 个采样间隔出现高丢包且速率相近时，会把发送速率钉死在采样值上长达 48 个 RTT。在存在 8%~14% 突发丢包的跨网转发或共享 NAT 链路上容易误触发，导致长期降速；v0.4 新增 `lt_bw_enable`（默认 `0` 关闭，线上改 `0` 时立即退出已钉死状态）。如果你跑在严格按速率限速的线路上，可随时 `echo 1 > lt_bw_enable` 重新开启。
+- **不跳过丢包恢复期 `packet_conservation`（v0.4 实测教训）**：v0.4 实测过在 `TCP_CA_Recovery` 期间跳过 `packet_conservation` 并维持 `prior_cwnd`（`loss_preserve_cwnd=1`），结果在突发丢包链路上反而引发重传风暴，上传吞吐大幅暴跌。该项仅保留为默认关闭的实验参数（`loss_preserve_cwnd=0`），**生产环境不要设为 `1`**。
+- **放宽 ACK 聚合补偿与轻量化 PROBE_RTT（v0.4）**：Wi-Fi、蜂窝网、虚拟化网卡及高抖动 NAT 链路常见 100~200ms 级的突发 ACK 合并；将 `extra_acked_win` 提高到 10 轮、`extra_acked_max_ms` 提高到 200ms，配合 `pacing_margin_pct=0` 与更轻的 `PROBE_RTT`（30 秒一次、60ms、0.75 × BDP），可显著减少吞吐锯齿。
+- **PROBE_RTT 不再“断崖”**：原版每 10 秒把 cwnd 降到 4 个包持续 200ms，长 RTT 链路上吞吐会周期性掉坑。v0.1 改为 0.5 × BDP（v0.4 调至 0.75 × BDP / 60ms / 30s），顺带修正了 tsunami 只把 cwnd 减半但进入计时条件仍为“在途包 ≤ 4”导致实际掉到 4 个包的问题。
 
 - **复用连接上的下载提速慢（v0.2 修复）**：网页、API 这类“一问一答”的小请求，会让 BBR 在很低的速度上就判定“带宽已满”，结束 STARTUP。之后同一条连接上开始下载文件或视频时，原版 BBR 每个探测周期（8 个往返，跨太平洋约 1.6 秒）只把速度提高 25%。代理、HTTP/2 这类长期复用的连接最容易遇到。v0.2 在 PROBE_BW 中只要看到非 app-limited 的采样明显高于当前带宽估计，就重新进入 STARTUP（v0.2 阈值 15%，v0.3 改为 8%）。
 
@@ -73,9 +78,38 @@ sysctl -w net.ipv4.tcp_congestion_control=bbr_aggr
 
 卸载：`make dkms-remove`（先把默认算法改回 `bbr`）。
 
-从旧版本升级（0.1.0 / 0.2.0）：先把默认算法改回 `bbr`，等用旧模块的连接结束（或用 `ss -K` 关掉），再执行 `dkms remove -m tcp_bbr_aggr -v <旧版本> --all`、`modprobe -r tcp_bbr_aggr`，然后按上面的步骤 `make dkms`。
+从旧版本升级（0.1.0 / 0.2.0 / 0.3.0）：先把默认算法改回 `bbr`，等用旧模块的连接结束（或用 `ss -K` 关掉），再执行 `dkms remove -m tcp_bbr_aggr -v <旧版本> --all`、`modprobe -r tcp_bbr_aggr`，然后按上面的步骤 `make dkms`。
 
-已在 Debian 13（6.12.113）和 Debian 12（6.1.0）上编译、DKMS 安装、加载，并跑过实际传输。内核 6.10 前后 `cong_control` 接口的差异已做兼容。
+> 持久化注意：`sysctl --system` 会在 `/etc/sysctl.d/*.conf` 之后最后加载遗留的 `/etc/sysctl.conf`。如果 `/etc/sysctl.conf` 中仍残留 `net.ipv4.tcp_congestion_control=bbr`，请一并删除，避免覆盖 `/etc/sysctl.d/` 配置。
+
+已在 Debian 13（6.12.113 / 6.12.117）和 Debian 12（6.1.0）上编译、DKMS 安装、加载，并跑过实际传输。内核 6.10 前后 `cong_control` 接口的差异已做兼容。
+
+## 配套内核与队列建议
+
+实测高 BDP 代理/多路复用场景中，仅改拥塞控制容易被默认 `fq` 单流队列上限与发送端缓冲卡住：
+
+```bash
+# 默认 fq 的 flow_limit=100p 在大窗口/高并发流上会产生大量 flows_plimit 丢包
+# 1GB+ 内存建议 flow_limit 4096（512MB 小内存建议 2048）
+tc qdisc replace dev <网卡名> root fq limit 20000 flow_limit 4096 buckets 1024 orphan_mask 1023 quantum 6056 initial_quantum 30280
+```
+
+推荐配套 sysctl（1GB+ 内存可用 32MB，512MB 小内存建议 16MB）：
+
+```ini
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr_aggr
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 262144 33554432
+net.ipv4.tcp_wmem = 4096 262144 33554432
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_autocorking = 0
+net.ipv4.tcp_reordering = 12
+net.ipv4.tcp_recovery = 1
+net.ipv4.tcp_mtu_probing = 1
+```
 
 ## 在线调参
 
@@ -90,12 +124,18 @@ sysctl -w net.ipv4.tcp_congestion_control=bbr_aggr
 | `probe_down_gain` | 750 [750] | 排空阶段发送倍数 |
 | `cruise_gain` | 1000 [1000] | 巡航发送倍数，大于 1000 会持续排队 |
 | `bw_rtts` | 15 [10] | 带宽最大值记忆多少轮 |
-| `min_rtt_win_sec` | 20 [10] | 多久做一次 PROBE_RTT（秒） |
-| `probe_rtt_mode_ms` | 100 [200] | PROBE_RTT 持续时间，0 = 不做 |
-| `probe_rtt_cwnd_gain` | 500 [0] | PROBE_RTT 时 cwnd 占 BDP 的比例，0 = 原版的 4 个包 |
+| `min_rtt_win_sec` | 30 [10] | 多久做一次 PROBE_RTT（秒） |
+| `probe_rtt_mode_ms` | 60 [200] | PROBE_RTT 持续时间，0 = 不做 |
+| `probe_rtt_cwnd_gain` | 750 [0] | PROBE_RTT 时 cwnd 占 BDP 的比例，0 = 原版的 4 个包 |
 | `rand_cycle` | 1 [0] | 1 = bbrplus 式随机探测周期，0 = 原版 8 阶段 |
 | `restartup_ratio` | 1080 [关] | 采样比带宽估计高出这个比例就重新进入 STARTUP（1050~4000），0 = 关闭 |
 | `restartup_count` | 只读 | 加载以来重新进入 STARTUP 的次数，用来确认是否生效 |
+| `lt_bw_enable` | 0 [1] | 1 = 启用原版 LT policer 限速钉死，0 = 禁用（避免突发丢包误限速） |
+| `pacing_margin_pct` | 0 [1] | 低于估计带宽的 pacing 预留百分比（0~10） |
+| `extra_acked_win` | 10 [5] | ACK 聚合采样窗口（轮数，2~30） |
+| `extra_acked_max_ms` | 200 [100] | ACK 聚合 cwnd 补偿上限（ms，20~500） |
+| `loss_preserve_cwnd` | 0 [0] | 实验参数：1 = 恢复期跳过 `packet_conservation`（实测易引发重传风暴，不建议开启） |
+| `loss_preserve_count` | 只读 | 加载以来实验性跳过恢复期减窗的次数 |
 
 例如恢复原版 PROBE_RTT 行为：
 
